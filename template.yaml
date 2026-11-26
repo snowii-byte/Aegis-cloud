@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AegisCloud v2 - autonomous incident detection and self-healing (interactive demo stack)
+
+Parameters:
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---- Monitored target (SSM-enabled so the dashboard can really stress its CPU) ----
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  Target:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: t3.micro
+      Monitoring: true
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags: [{Key: Name, Value: aegis-web-01}]
+
+  # ---- Incident store ----
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: ts, AttributeType: N}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: ts, KeyType: RANGE}
+
+  # ---- Detection path 1: CloudWatch alarms -> SNS -> Lambda ----
+  Topic:
+    Type: AWS::SNS::Topic
+
+  CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: AegisCloud-HighCPU
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{Name: InstanceId, Value: !Ref Target}]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Topic]
+
+  StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: AegisCloud-StatusCheckFailed
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{Name: InstanceId, Value: !Ref Target}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Topic]
+
+  # ---- Detection path 2: EC2 "stopped" event -> EventBridge -> Lambda ----
+  StopRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Instance State-change Notification]
+        detail:
+          state: [stopped]
+          instance-id: [!Ref Target]
+      Targets:
+        - {Arn: !GetAtt Fn.Arn, Id: healer}
+
+  # ---- Healer + API Lambda ----
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: aegis
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ec2:DescribeInstanceStatus, cloudwatch:GetMetricStatistics]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ec2:RebootInstances, ec2:StartInstances, ec2:StopInstances]
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Target}
+              - Effect: Allow
+                Action: [ssm:SendCommand]
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Target}
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Query]
+                Resource: !GetAtt Table.Arn
+
+  Fn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt Role.Arn
+      Environment:
+        Variables:
+          TABLE: !Ref Table
+          INSTANCE_ID: !Ref Target
+      Code:
+        ZipFile: |
+          import json,os,time,uuid,boto3
+          T=boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          E=boto3.client('ec2');I=os.environ['INSTANCE_ID']
+          def st():
+              r=E.describe_instance_status(InstanceIds=[I],IncludeAllInstances=True)
+              return r['InstanceStatuses'][0]['InstanceState']['Name']
+          def log(k,s,m,a):
+              T.put_item(Item={'pk':'inc','ts':int(time.time()*1000),'id':uuid.uuid4().hex[:8],'kind':k,'sev':s,'msg':m,'action':a,'status':'RESOLVED'})
+          def heal():
+              s=st()
+              if s=='stopped':
+                  E.start_instances(InstanceIds=[I]);return 'Started instance '+I
+              if s=='running':
+                  E.reboot_instances(InstanceIds=[I]);return 'Rebooted instance '+I
+              return 'Instance is '+s+', recovering'
+          def out(b):
+              return {'statusCode':200,'headers':{'Content-Type':'application/json'},'body':json.dumps(b,default=int)}
+          def handler(e,c):
+              if 'Records' in e:
+                  for r in e['Records']:
+                      a=json.loads(r['Sns']['Message'])
+                      log(a['AlarmName'],'HIGH',a['NewStateReason'][:140],heal())
+                  return
+              if e.get('source')=='aws.ec2':
+                  E.start_instances(InstanceIds=[I])
+                  log('Instance stopped','CRITICAL','EC2 state-change event: server went down','Auto-started instance '+I)
+                  return
+              p=e.get('rawPath','');m=e['requestContext']['http']['method']
+              if p.endswith('/incidents'):
+                  q=T.query(KeyConditionExpression='pk=:p',ExpressionAttributeValues={':p':'inc'},ScanIndexForward=False,Limit=20)
+                  return out(q['Items'])
+              if p.endswith('/status'):
+                  d=boto3.client('cloudwatch').get_metric_statistics(Namespace='AWS/EC2',MetricName='CPUUtilization',Dimensions=[{'Name':'InstanceId','Value':I}],StartTime=time.time()-900,EndTime=time.time(),Period=60,Statistics=['Average'])['Datapoints']
+                  d.sort(key=lambda x:x['Timestamp'])
+                  return out({'state':st(),'cpu':round(d[-1]['Average'],1) if d else None})
+              if m=='POST':
+                  if p.endswith('/crash'):
+                      E.stop_instances(InstanceIds=[I])
+                  if p.endswith('/stress'):
+                      x="setsid nohup timeout 420 sh -c 'while :;do :;done' >/dev/null 2>&1 &"
+                      boto3.client('ssm').send_command(InstanceIds=[I],DocumentName='AWS-RunShellScript',Parameters={'commands':[x+x]})
+                  if p.endswith('/simulate'):
+                      log('Simulated failure','CRITICAL','Chaos injection from dashboard',heal())
+              return out({'ok':1})
+
+  SnsPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref Topic
+
+  EventsPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopRule.Arn
+
+  Sub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref Topic
+      Endpoint: !GetAtt Fn.Arn
+
+  # ---- Public API ----
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: aegiscloud-api
+      ProtocolType: HTTP
+      Target: !GetAtt Fn.Arn
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: ['*']
+
+  ApiPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Fn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*
+
+  # ---- Website hosting ----
+  Site:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration: {IndexDocument: index.html}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  SitePolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Site
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub ${Site.Arn}/*
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt Api.ApiEndpoint
+  WebsiteBucket:
+    Value: !Ref Site
+  WebsiteURL:
+    Value: !GetAtt Site.WebsiteURL
+  InstanceId:
+    Value: !Ref Target
